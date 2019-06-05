@@ -35,25 +35,14 @@
 #define SCTLR_BIT_AFE (1 << 29)
 
 /*  V7 method VA TO PA  */
-int armv7a_mmu_translate_va_pa(struct target *target, uint32_t va,
+static int armv7a_mmu_translate_va_pa_short(struct arm_dpm *dpm, uint32_t va,
 	target_addr_t *val, int meminfo)
 {
 	int retval = ERROR_FAIL;
-	struct armv7a_common *armv7a = target_to_armv7a(target);
-	struct arm_dpm *dpm = armv7a->arm.dpm;
-	uint32_t virt = va & ~0xfff, value;
+	uint32_t value;
 	uint32_t NOS, NS, INNER, OUTER, SS;
 	*val = 0xdeadbeef;
-	retval = dpm->prepare(dpm);
-	if (retval != ERROR_OK)
-		goto done;
-	/*  mmu must be enable in order to get a correct translation
-	 *  use VA to PA CP15 register for conversion */
-	retval = dpm->instr_write_data_r0(dpm,
-			ARMV4_5_MCR(15, 0, 0, 7, 8, 0),
-			virt);
-	if (retval != ERROR_OK)
-		goto done;
+
 	retval = dpm->instr_read_data_r0(dpm,
 			ARMV4_5_MRC(15, 0, 0, 7, 4, 0),
 			&value);
@@ -127,6 +116,30 @@ int armv7a_mmu_translate_va_pa(struct target *target, uint32_t va,
 		}
 	}
 
+done:
+	return retval;
+}
+
+/*  V7 method VA TO PA  */
+int armv7a_mmu_translate_va_pa(struct target *target, uint32_t va,
+	target_addr_t *val, int meminfo)
+{
+	struct armv7a_common *armv7a = target_to_armv7a(target);
+	struct arm_dpm *dpm = armv7a->arm.dpm;
+	int retval = ERROR_FAIL;
+	uint32_t virt = va & ~0xfff;
+
+	retval = dpm->prepare(dpm);
+	if (retval != ERROR_OK)
+		goto done;
+	/*  mmu must be enable in order to get a correct translation
+	 *  use VA to PA CP15 register for conversion */
+	retval = dpm->instr_write_data_r0(dpm,
+			ARMV4_5_MCR(15, 0, 0, 7, 8, 0),
+			virt);
+	if (retval != ERROR_OK)
+		goto done;
+	retval = armv7a_mmu_translate_va_pa_short(dpm, va, val, meminfo);
 done:
 	dpm->finish(dpm);
 
