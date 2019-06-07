@@ -34,6 +34,8 @@
 
 #define SCTLR_BIT_AFE (1 << 29)
 
+#define TTBCR_BIT_EAE (1 << 31)
+
 /*  V7 method VA TO PA  */
 static int armv7a_mmu_translate_va_pa_short(struct arm_dpm *dpm, uint32_t va,
 	target_addr_t *val, int meminfo)
@@ -42,6 +44,8 @@ static int armv7a_mmu_translate_va_pa_short(struct arm_dpm *dpm, uint32_t va,
 	uint32_t value;
 	uint32_t NOS, NS, INNER, OUTER, SS;
 	*val = 0xdeadbeef;
+
+	LOG_INFO("SHORT DESCRIPTOR");
 
 	retval = dpm->instr_read_data_r0(dpm,
 			ARMV4_5_MRC(15, 0, 0, 7, 4, 0),
@@ -120,18 +124,93 @@ done:
 	return retval;
 }
 
+static const char *armv7a_mmu_decoce_mair(uint8_t attr)
+{
+	uint8_t a1 = attr & 0xf, a2 = attr >> 4;
+
+	if (a1 == 0 && a2 == 0)
+		return "strongly ordered memory";
+	else if (a1 == 4) {
+	       if (a2 == 0)
+		       return "device memory";
+	       else if (a2 == 0)
+		       return "normal memory, inner non-cacheable";
+	} else if ((a1 & 0x8) && a2) {
+		if ((a1 & 0xc) == 0x8)
+			return "normal memory, inner write-through cachable";
+		else if ((a1 & 0xc) == 0xc)
+			return "normal memory, inner write-back cacheable";
+	}
+
+	return "unpredictable";
+}
+
+static int armv7a_mmu_translate_va_pa_long(struct arm_dpm *dpm, uint32_t va,
+	target_addr_t *val, int meminfo)
+{
+	const char *shareability[] = {
+		"non-shareable",
+		"unpredictable",
+		"outer shareable",
+		"inner shareable"
+	};
+	uint64_t val64;
+	int retval = ERROR_FAIL;
+	uint32_t NS, SH;
+
+	LOG_INFO("LONG DESCRIPTOR");
+
+	*val = 0xdeadbeef;
+	retval = dpm->instr_read_data_r0_64(dpm,
+			ARMV5_T_MRRC(15, 0, 0, 1, 7),
+			&val64);
+	if (retval != ERROR_OK)
+		goto done;
+
+	LOG_INFO("val64: 0x%lx", val64);
+
+	*val = val64;
+	if (*val & 1) {
+		LOG_ERROR("translation fault");
+		goto done;
+	}
+	/* decode memory attributes */
+	NS = (*val >> 9) & 1;	/* Non secure */
+	SH = (*val >> 8) & 0x3;
+	*val = (*val & ~0xffffff0000000fff) + (va & 0xfff);
+
+	if (meminfo) {
+		LOG_INFO("%" PRIx32 " : %" TARGET_PRIxADDR " %s %s secured ATTR: %s",
+			va, *val,
+			shareability[SH],
+			NS == 1 ? "not" : "",
+			armv7a_mmu_decoce_mair(*val >> 56));
+	}
+done:
+	return retval;
+}
+
 /*  V7 method VA TO PA  */
 int armv7a_mmu_translate_va_pa(struct target *target, uint32_t va,
 	target_addr_t *val, int meminfo)
 {
 	struct armv7a_common *armv7a = target_to_armv7a(target);
 	struct arm_dpm *dpm = armv7a->arm.dpm;
-	int retval = ERROR_FAIL;
 	uint32_t virt = va & ~0xfff;
+	uint32_t value;
+	int retval = ERROR_FAIL;
 
 	retval = dpm->prepare(dpm);
 	if (retval != ERROR_OK)
 		goto done;
+
+	/* read ID_MMFR0 to determine capabilities */
+	retval = dpm->instr_read_data_r0(dpm,
+			ARMV4_5_MRC(15, 0, 0, 0, 1, 4),
+			&value);
+	if (retval != ERROR_OK)
+		goto done;
+
 	/*  mmu must be enable in order to get a correct translation
 	 *  use VA to PA CP15 register for conversion */
 	retval = dpm->instr_write_data_r0(dpm,
@@ -139,7 +218,29 @@ int armv7a_mmu_translate_va_pa(struct target *target, uint32_t va,
 			virt);
 	if (retval != ERROR_OK)
 		goto done;
-	retval = armv7a_mmu_translate_va_pa_short(dpm, va, val, meminfo);
+
+	/* Check for VMSA capability */
+	if ((value & 0xf) != 0x5) {
+		retval = armv7a_mmu_translate_va_pa_short(dpm, va, val,
+							  meminfo);
+		goto done;
+	}
+
+	/* Read TTBCR to determine if system is making use of long
+	 * descriptors
+	 */
+	retval = dpm->instr_read_data_r0(dpm,
+			ARMV4_5_MRC(15, 0, 0, 2, 0, 2),
+			&value);
+	if (retval != ERROR_OK)
+		goto done;
+
+	if (!(value & TTBCR_BIT_EAE)) {
+		retval = armv7a_mmu_translate_va_pa_short(dpm, va, val,
+							  meminfo);
+		goto done;
+	}
+	retval = armv7a_mmu_translate_va_pa_long(dpm, va, val, meminfo);
 done:
 	dpm->finish(dpm);
 
